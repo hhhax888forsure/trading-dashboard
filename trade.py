@@ -1,6 +1,7 @@
 import streamlit as st
 import yfinance as yf
 from datetime import datetime, timezone, timedelta
+import pandas as pd
 
 # =========================
 # 你的回撤规则（可自己改）
@@ -32,25 +33,92 @@ def fmt_price(x: float) -> str:
 def fmt_pct(x: float) -> str:
     return f"{x*100:.2f}%"
 
-@st.cache_data(ttl=60)
-def get_intraday_last_and_high(ticker: str):
-    t = yf.Ticker(ticker)
-    df = t.history(period="1d", interval="1m")
-    if df is None or df.empty:
-        df2 = t.history(period="5d", interval="1d")
-        if df2 is None or df2.empty:
-            return None, None
-        return float(df2["Close"].iloc[-1]), float(df2["High"].iloc[-1])
+# =========================
+# ✅ 批量拉取数据（解决 yfinance 限流）
+# =========================
 
-    return float(df["Close"].iloc[-1]), float(df["High"].max())
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_intraday_batch(tickers: list[str], interval: str = "5m") -> pd.DataFrame:
+    """
+    一次性拉取多个 ticker 的当日分时，减少请求次数，降低被限流概率
+    interval 推荐 5m（比 1m 稳很多）
+    """
+    symbols = " ".join(tickers)
+    df = yf.download(
+        tickers=symbols,
+        period="1d",
+        interval=interval,
+        group_by="ticker",
+        auto_adjust=False,
+        threads=False,
+        progress=False,
+    )
+    return df
 
-@st.cache_data(ttl=6 * 60 * 60)
-def get_all_time_high(ticker: str):
-    t = yf.Ticker(ticker)
-    df = t.history(period="max", interval="1d")
+@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
+def fetch_ath_batch(tickers: list[str]) -> dict:
+    """
+    一次性拉取多个 ticker 的历史最高点（All-time high）
+    """
+    symbols = " ".join(tickers)
+    df = yf.download(
+        tickers=symbols,
+        period="max",
+        interval="1d",
+        group_by="ticker",
+        auto_adjust=False,
+        threads=False,
+        progress=False,
+    )
+
+    ath_map = {}
     if df is None or df.empty:
-        return None
-    return float(df["High"].max())
+        return ath_map
+
+    if isinstance(df.columns, pd.MultiIndex):
+        for tk in tickers:
+            try:
+                sub = df[tk].dropna()
+                if sub.empty:
+                    continue
+                ath_map[tk] = float(sub["High"].max())
+            except Exception:
+                continue
+    else:
+        # 单 ticker 情况（一般不会发生，因为你是3个）
+        try:
+            sub = df.dropna()
+            ath_map[tickers[0]] = float(sub["High"].max())
+        except Exception:
+            pass
+
+    return ath_map
+
+def get_last_and_day_high_from_batch(df: pd.DataFrame, ticker: str):
+    """
+    从批量分时数据里取某个 ticker 的 last_price / day_high
+    """
+    if df is None or df.empty:
+        return None, None
+
+    try:
+        if isinstance(df.columns, pd.MultiIndex):
+            sub = df[ticker].dropna()
+            if sub.empty:
+                return None, None
+            last_price = float(sub["Close"].iloc[-1])
+            day_high = float(sub["High"].max())
+            return last_price, day_high
+        else:
+            # 单 ticker fallback
+            sub = df.dropna()
+            if sub.empty:
+                return None, None
+            last_price = float(sub["Close"].iloc[-1])
+            day_high = float(sub["High"].max())
+            return last_price, day_high
+    except Exception:
+        return None, None
 
 # =========================
 # Streamlit 基本设置
@@ -121,31 +189,22 @@ st.markdown(
         background: rgba(255,255,255,0.04);
         color: #ffffff;
         margin-top: 10px;
-    }/* ===== Sidebar：左侧黑底白字 ===== */
+    }
 
-section[data-testid="stSidebar"] {
-    background-color: #0a0d12 !important;
-    border-right: 1px solid rgba(255,255,255,0.08);
-}
-
-section[data-testid="stSidebar"] * {
-    color: #f5f7fa !important;
-}
-
-section[data-testid="stSidebar"] h1,
-section[data-testid="stSidebar"] h2,
-section[data-testid="stSidebar"] h3 {
-    color: #ffffff !important;
-}
-
-section[data-testid="stSidebar"] label {
-    color: #cfd8e3 !important;
-}
-
-section[data-testid="stSidebar"] hr {
-    border-color: rgba(255,255,255,0.12) !important;
-}
-
+    /* ===== Sidebar：左侧黑底白字 ===== */
+    section[data-testid="stSidebar"] {
+        background-color: #0a0d12 !important;
+        border-right: 1px solid rgba(255,255,255,0.08);
+    }
+    section[data-testid="stSidebar"] * {
+        color: #f5f7fa !important;
+    }
+    section[data-testid="stSidebar"] label {
+        color: #cfd8e3 !important;
+    }
+    section[data-testid="stSidebar"] hr {
+        border-color: rgba(255,255,255,0.12) !important;
+    }
     </style>
     """,
     unsafe_allow_html=True
@@ -161,7 +220,8 @@ st.caption(f"当前时间（北京时间）：{bj_time.strftime('%Y-%m-%d %H:%M:
 
 with st.sidebar:
     st.header("设置")
-    refresh = st.slider("自动刷新间隔（秒）", 5, 120, 15, 5)
+    # ✅ 建议别太频繁，否则再稳也可能被限流
+    refresh = st.slider("自动刷新间隔（秒）", 15, 300, 60, 15)
     st.markdown(
         """
         **规则分层**
@@ -186,17 +246,21 @@ st.markdown(
     unsafe_allow_html=True
 )
 
+# ✅ 这里提前批量抓数据：只打 2 次网络请求（分时一次 + ATH一次）
+intraday_df = fetch_intraday_batch(TICKERS, interval="5m")
+ath_map = fetch_ath_batch(TICKERS)
+
 cols = st.columns(len(TICKERS))
 
 def render_ticker(col, ticker: str):
     with col:
         st.subheader(f"标的：{ticker}")
 
-        last_price, day_high = get_intraday_last_and_high(ticker)
-        ath = get_all_time_high(ticker)
+        last_price, day_high = get_last_and_day_high_from_batch(intraday_df, ticker)
+        ath = ath_map.get(ticker)
 
         if last_price is None or day_high is None or ath is None:
-            st.error("行情获取失败，稍后自动刷新")
+            st.warning("行情被限流/暂时不可用（已启用缓存兜底），稍后自动刷新")
             return
 
         drawdown = max(0.0, (ath - last_price) / ath)
