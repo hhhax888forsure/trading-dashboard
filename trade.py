@@ -35,14 +35,37 @@ def fmt_pct(x: float) -> str:
     return f"{x*100:.2f}%"
 
 # =========================
-# ✅ 批量拉取分时（优先1m，更准；失败自动降级2m/5m）
+# ✅ 最快：批量拿“最新价”（fast_info）
+# - 免费里尽可能接近实时
+# - 用缓存减少频繁请求
 # =========================
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_intraday_batch(tickers: list[str]) -> tuple[pd.DataFrame, str]:
+@st.cache_data(ttl=2, show_spinner=False)
+def fetch_last_fast_batch(tickers: list[str]) -> tuple[dict, str]:
     """
-    优先 1m（更准），失败则降级 2m/5m
-    返回 (df, interval_used)
+    返回 (last_price_map, updated_at_str)
     """
+    out = {}
+    for tk in tickers:
+        try:
+            t = yf.Ticker(tk)
+            lp = t.fast_info.get("last_price", None)
+            if lp is not None:
+                out[tk] = float(lp)
+        except Exception:
+            pass
+
+    # 标记更新时间（LA时间更符合你交易）
+    la_now = datetime.now(ZoneInfo("America/Los_Angeles"))
+    return out, la_now.strftime("%Y-%m-%d %H:%M:%S")
+
+# =========================
+# ✅ 分时：主要用来拿 day_high（盘中高点）
+# - 优先 1m，更准
+# - 失败降级 2m/5m
+# - 缓存 ttl 稍微长点，减少限流
+# =========================
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_intraday_batch_for_high(tickers: list[str]) -> tuple[pd.DataFrame, str]:
     symbols = " ".join(tickers)
     for interval in ["1m", "2m", "5m"]:
         try:
@@ -61,8 +84,27 @@ def fetch_intraday_batch(tickers: list[str]) -> tuple[pd.DataFrame, str]:
             pass
     return pd.DataFrame(), "NA"
 
+def get_day_high_from_batch(df: pd.DataFrame, ticker: str):
+    if df is None or df.empty:
+        return None
+    try:
+        if isinstance(df.columns, pd.MultiIndex):
+            sub = df[ticker].dropna()
+            if sub.empty:
+                return None
+            return float(sub["High"].max())
+        else:
+            sub = df.dropna()
+            if sub.empty:
+                return None
+            return float(sub["High"].max())
+    except Exception:
+        return None
+
 # =========================
-# ✅ 批量拉取历史最高点（ATH）
+# ✅ ATH：历史最高点（All-time high）
+# - 拉 max 日线
+# - 缓存 6小时，避免重复请求
 # =========================
 @st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
 def fetch_ath_batch(tickers: list[str]) -> dict:
@@ -99,82 +141,30 @@ def fetch_ath_batch(tickers: list[str]) -> dict:
 
     return ath_map
 
-def get_last_and_day_high_from_batch(df: pd.DataFrame, ticker: str):
-    if df is None or df.empty:
-        return None, None
-
-    try:
-        if isinstance(df.columns, pd.MultiIndex):
-            sub = df[ticker].dropna()
-            if sub.empty:
-                return None, None
-            last_price = float(sub["Close"].iloc[-1])
-            day_high = float(sub["High"].max())
-            return last_price, day_high
-        else:
-            sub = df.dropna()
-            if sub.empty:
-                return None, None
-            last_price = float(sub["Close"].iloc[-1])
-            day_high = float(sub["High"].max())
-            return last_price, day_high
-    except Exception:
-        return None, None
-
 # =========================
 # Streamlit 基本设置
 # =========================
-st.set_page_config(
-    page_title="交易纪律执行助手",
-    layout="wide",
-)
+st.set_page_config(page_title="交易纪律执行助手", layout="wide")
 
 # =========================
-# 🔥 终极暗黑 CSS + 状态颜色/闪烁
+# 🔥 暗黑 CSS + 状态颜色/闪烁
 # =========================
 st.markdown(
     """
     <style>
-    /* ===== ① 干掉顶部白色 Header ===== */
-    header[data-testid="stHeader"] {
-        background: rgba(0,0,0,0) !important;
-        height: 0px !important;
-    }
-    div[data-testid="stToolbar"] {
-        visibility: hidden !important;
-        height: 0px !important;
-    }
-    div[data-testid="stDecoration"] {
-        display: none !important;
-    }
+    header[data-testid="stHeader"] { background: rgba(0,0,0,0) !important; height: 0px !important; }
+    div[data-testid="stToolbar"] { visibility: hidden !important; height: 0px !important; }
+    div[data-testid="stDecoration"] { display: none !important; }
 
-    /* ===== ② 全局黑色背景 ===== */
-    .stApp {
-        background-color: #0b0f14;
-    }
+    .stApp { background-color: #0b0f14; }
 
-    /* ===== ③ 全站文字强制白色体系 ===== */
-    html, body, [class*="css"] {
-        color: #f5f7fa !important;
-    }
-    h1, h2, h3, h4, h5 {
-        color: #ffffff !important;
-    }
-    .stCaption, .stMarkdown, .stText {
-        color: #cfd8e3 !important;
-    }
+    html, body, [class*="css"] { color: #f5f7fa !important; }
+    h1, h2, h3, h4, h5 { color: #ffffff !important; }
+    .stCaption, .stMarkdown, .stText { color: #cfd8e3 !important; }
 
-    /* ===== ④ 指标卡片文字 ===== */
-    div[data-testid="stMetricLabel"] {
-        color: #9fb3c8 !important;
-        font-size: 0.85rem;
-    }
-    div[data-testid="stMetricValue"] {
-        color: #ffffff !important;
-        font-weight: 600;
-    }
+    div[data-testid="stMetricLabel"] { color: #9fb3c8 !important; font-size: 0.85rem; }
+    div[data-testid="stMetricValue"] { color: #ffffff !important; font-weight: 600; }
 
-    /* ===== ⑤ 指标卡片样式 ===== */
     div[data-testid="stMetric"] {
         background: rgba(255,255,255,0.03);
         border: 1px solid rgba(255,255,255,0.08);
@@ -182,7 +172,6 @@ st.markdown(
         padding: 12px;
     }
 
-    /* ===== ⑥ 状态条 ===== */
     .status-box {
         padding: 12px 14px;
         border-radius: 10px;
@@ -192,33 +181,22 @@ st.markdown(
         margin-top: 10px;
     }
 
-    /* ===== Sidebar：左侧黑底白字 ===== */
     section[data-testid="stSidebar"] {
         background-color: #0a0d12 !important;
         border-right: 1px solid rgba(255,255,255,0.08);
     }
-    section[data-testid="stSidebar"] * {
-        color: #f5f7fa !important;
-    }
-    section[data-testid="stSidebar"] label {
-        color: #cfd8e3 !important;
-    }
-    section[data-testid="stSidebar"] hr {
-        border-color: rgba(255,255,255,0.12) !important;
-    }
+    section[data-testid="stSidebar"] * { color: #f5f7fa !important; }
+    section[data-testid="stSidebar"] label { color: #cfd8e3 !important; }
+    section[data-testid="stSidebar"] hr { border-color: rgba(255,255,255,0.12) !important; }
 
-    /* ===== ⑦ 状态颜色/闪烁 ===== */
     @keyframes blinkGreen {
         0%   { opacity: 1; }
         50%  { opacity: 0.2; }
         100% { opacity: 1; }
     }
-    .status-text { font-weight: 700; }
+    .status-text { font-weight: 800; }
 
-    .status-buy {
-        color: #2cff6a !important;
-        animation: blinkGreen 1s infinite;
-    }
+    .status-buy  { color: #2cff6a !important; animation: blinkGreen 1s infinite; }
     .status-wait { color: #ffd34d !important; }
     .status-good { color: #9dffb8 !important; }
     .status-prep { color: #b6c7ff !important; }
@@ -244,8 +222,9 @@ st.caption(
 with st.sidebar:
     st.header("设置")
 
-    # ✅ 建议别太频繁，否则再稳也可能被限流
-    refresh = st.slider("自动刷新间隔（秒）", 15, 300, 60, 15)
+    # ✅ 你要最快：最低 3 秒（再快更容易被限流）
+    refresh = st.slider("自动刷新间隔（秒）", 3, 60, 5, 1)
+
     st.markdown(
         """
         **规则分层**
@@ -258,7 +237,7 @@ with st.sidebar:
         """
     )
 
-# 自动刷新
+# ✅ 自动刷新（你原来的方式保留）
 st.markdown(
     f"""
     <script>
@@ -270,11 +249,22 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-# ✅ 这里提前批量抓数据：只打 2 次网络请求（分时一次 + ATH一次）
-intraday_df, interval_used = fetch_intraday_batch(TICKERS)
+# =========================
+# ✅ 数据拉取（最快优先）
+# =========================
+# 1) 最新价：fast_info（免费里最接近实时）
+last_map, last_updated_at = fetch_last_fast_batch(TICKERS)
+
+# 2) 分时：只负责盘中高点（缓存稍长，减少限流）
+intraday_df, interval_used = fetch_intraday_batch_for_high(TICKERS)
+
+# 3) ATH：历史最高点（缓存6小时）
 ath_map = fetch_ath_batch(TICKERS)
 
-st.caption(f"分时精度：{interval_used}（优先1m，失败自动降级防限流）")
+st.caption(
+    f"最新价来源：fast_info（更新于 LA {last_updated_at}）｜"
+    f"盘中高点分时精度：{interval_used}（自动降级防限流）"
+)
 
 cols = st.columns(len(TICKERS))
 
@@ -282,11 +272,17 @@ def render_ticker(col, ticker: str):
     with col:
         st.subheader(f"标的：{ticker}")
 
-        last_price, day_high = get_last_and_day_high_from_batch(intraday_df, ticker)
+        # ✅ 最新价：优先 fast_info
+        last_price = last_map.get(ticker)
+
+        # ✅ 盘中高点：来自分时 High.max()
+        day_high = get_day_high_from_batch(intraday_df, ticker)
+
+        # ✅ ATH：历史最高点
         ath = ath_map.get(ticker)
 
         if last_price is None or day_high is None or ath is None:
-            st.warning("行情被限流/暂时不可用（已启用缓存兜底），稍后自动刷新")
+            st.warning("行情暂时不可用/被限流（已启用缓存兜底），稍后自动刷新")
             return
 
         drawdown = max(0.0, (ath - last_price) / ath)
@@ -301,7 +297,7 @@ def render_ticker(col, ticker: str):
         }.get(status_kind, "status-watch")
 
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("最新价格", fmt_price(last_price))
+        c1.metric("最新价格（fast）", fmt_price(last_price))
         c2.metric("盘中高点(今日)", fmt_price(day_high))
         c3.metric("历史最高点(ALL)", fmt_price(ath))
         c4.metric("从历史最高点回撤", fmt_pct(drawdown))
