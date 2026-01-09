@@ -1,6 +1,7 @@
 import streamlit as st
 import yfinance as yf
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
+from zoneinfo import ZoneInfo
 import pandas as pd
 
 # =========================
@@ -16,16 +17,16 @@ TICKERS = ["QQQ", "SMH", "VGT"]
 # =========================
 # 工具函数
 # =========================
-def classify(drawdown: float) -> str:
+def classify(drawdown: float) -> tuple[str, str]:
     if drawdown >= LEVEL_BUY:
-        return "触发买入区间（≥4.5%）"
+        return "触发买入区间（≥4.5%）", "buy"
     if drawdown >= LEVEL_GOOD:
-        return "适合进场（≥3.5%）"
+        return "适合进场（≥3.5%）", "good"
     if drawdown >= LEVEL_PREP:
-        return "准备进场（≥3.0%）"
+        return "准备进场（≥3.0%）", "prep"
     if drawdown >= LEVEL_WAIT:
-        return "等待（≥2.0%）"
-    return "观望（<2.0%)"
+        return "等待（≥2.0%）", "wait"
+    return "观望（<2.0%)", "watch"
 
 def fmt_price(x: float) -> str:
     return f"{x:.2f}"
@@ -34,32 +35,37 @@ def fmt_pct(x: float) -> str:
     return f"{x*100:.2f}%"
 
 # =========================
-# ✅ 批量拉取数据（解决 yfinance 限流）
+# ✅ 批量拉取分时（优先1m，更准；失败自动降级2m/5m）
 # =========================
-
-@st.cache_data(ttl=120, show_spinner=False)
-def fetch_intraday_batch(tickers: list[str], interval: str = "5m") -> pd.DataFrame:
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_intraday_batch(tickers: list[str]) -> tuple[pd.DataFrame, str]:
     """
-    一次性拉取多个 ticker 的当日分时，减少请求次数，降低被限流概率
-    interval 推荐 5m（比 1m 稳很多）
+    优先 1m（更准），失败则降级 2m/5m
+    返回 (df, interval_used)
     """
     symbols = " ".join(tickers)
-    df = yf.download(
-        tickers=symbols,
-        period="1d",
-        interval=interval,
-        group_by="ticker",
-        auto_adjust=False,
-        threads=False,
-        progress=False,
-    )
-    return df
+    for interval in ["1m", "2m", "5m"]:
+        try:
+            df = yf.download(
+                tickers=symbols,
+                period="1d",
+                interval=interval,
+                group_by="ticker",
+                auto_adjust=False,
+                threads=False,
+                progress=False,
+            )
+            if df is not None and not df.empty:
+                return df, interval
+        except Exception:
+            pass
+    return pd.DataFrame(), "NA"
 
+# =========================
+# ✅ 批量拉取历史最高点（ATH）
+# =========================
 @st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
 def fetch_ath_batch(tickers: list[str]) -> dict:
-    """
-    一次性拉取多个 ticker 的历史最高点（All-time high）
-    """
     symbols = " ".join(tickers)
     df = yf.download(
         tickers=symbols,
@@ -85,7 +91,6 @@ def fetch_ath_batch(tickers: list[str]) -> dict:
             except Exception:
                 continue
     else:
-        # 单 ticker 情况（一般不会发生，因为你是3个）
         try:
             sub = df.dropna()
             ath_map[tickers[0]] = float(sub["High"].max())
@@ -95,9 +100,6 @@ def fetch_ath_batch(tickers: list[str]) -> dict:
     return ath_map
 
 def get_last_and_day_high_from_batch(df: pd.DataFrame, ticker: str):
-    """
-    从批量分时数据里取某个 ticker 的 last_price / day_high
-    """
     if df is None or df.empty:
         return None, None
 
@@ -110,7 +112,6 @@ def get_last_and_day_high_from_batch(df: pd.DataFrame, ticker: str):
             day_high = float(sub["High"].max())
             return last_price, day_high
         else:
-            # 单 ticker fallback
             sub = df.dropna()
             if sub.empty:
                 return None, None
@@ -129,7 +130,7 @@ st.set_page_config(
 )
 
 # =========================
-# 🔥 终极暗黑 CSS（你要的全部都在这）
+# 🔥 终极暗黑 CSS + 状态颜色/闪烁
 # =========================
 st.markdown(
     """
@@ -205,6 +206,23 @@ st.markdown(
     section[data-testid="stSidebar"] hr {
         border-color: rgba(255,255,255,0.12) !important;
     }
+
+    /* ===== ⑦ 状态颜色/闪烁 ===== */
+    @keyframes blinkGreen {
+        0%   { opacity: 1; }
+        50%  { opacity: 0.2; }
+        100% { opacity: 1; }
+    }
+    .status-text { font-weight: 700; }
+
+    .status-buy {
+        color: #2cff6a !important;
+        animation: blinkGreen 1s infinite;
+    }
+    .status-wait { color: #ffd34d !important; }
+    .status-good { color: #9dffb8 !important; }
+    .status-prep { color: #b6c7ff !important; }
+    .status-watch{ color: #cfd8e3 !important; }
     </style>
     """,
     unsafe_allow_html=True
@@ -215,21 +233,27 @@ st.markdown(
 # =========================
 st.title("交易纪律执行助手")
 
-bj_time = datetime.now(timezone.utc) + timedelta(hours=8)
-st.caption(f"当前时间（北京时间）：{bj_time.strftime('%Y-%m-%d %H:%M:%S')}")
+# ✅ 双时区时间（自动夏令时）
+bj_time = datetime.now(ZoneInfo("Asia/Shanghai"))
+la_time = datetime.now(ZoneInfo("America/Los_Angeles"))
+st.caption(
+    f"当前时间：北京时间 {bj_time.strftime('%Y-%m-%d %H:%M:%S')} ｜"
+    f"洛杉矶时间 {la_time.strftime('%Y-%m-%d %H:%M:%S')}"
+)
 
 with st.sidebar:
     st.header("设置")
+
     # ✅ 建议别太频繁，否则再稳也可能被限流
     refresh = st.slider("自动刷新间隔（秒）", 15, 300, 60, 15)
     st.markdown(
         """
         **规则分层**
-        - ≥2%：等待  
-        - ≥3%：准备进场  
-        - ≥3.5%：适合进场  
-        - ≥4.5%：触发买入区间  
-        
+        - ≥2%：等待
+        - ≥3%：准备进场
+        - ≥3.5%：适合进场
+        - ≥4.5%：触发买入区间
+
         ⚠️ 当前高点：**历史最高点（All-time high）**
         """
     )
@@ -247,8 +271,10 @@ st.markdown(
 )
 
 # ✅ 这里提前批量抓数据：只打 2 次网络请求（分时一次 + ATH一次）
-intraday_df = fetch_intraday_batch(TICKERS, interval="5m")
+intraday_df, interval_used = fetch_intraday_batch(TICKERS)
 ath_map = fetch_ath_batch(TICKERS)
+
+st.caption(f"分时精度：{interval_used}（优先1m，失败自动降级防限流）")
 
 cols = st.columns(len(TICKERS))
 
@@ -264,7 +290,15 @@ def render_ticker(col, ticker: str):
             return
 
         drawdown = max(0.0, (ath - last_price) / ath)
-        status = classify(drawdown)
+        status_text, status_kind = classify(drawdown)
+
+        status_class = {
+            "buy": "status-buy",
+            "wait": "status-wait",
+            "good": "status-good",
+            "prep": "status-prep",
+            "watch": "status-watch",
+        }.get(status_kind, "status-watch")
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("最新价格", fmt_price(last_price))
@@ -275,7 +309,8 @@ def render_ticker(col, ticker: str):
         st.markdown(
             f"""
             <div class="status-box">
-                <b>状态：</b> {status}
+                <b>状态：</b>
+                <span class="status-text {status_class}">{status_text}</span>
             </div>
             """,
             unsafe_allow_html=True
