@@ -22,7 +22,7 @@ TICKERS = ["QQQ", "SMH", "VGT"]
 st.set_page_config(page_title="交易纪律执行助手", layout="wide")
 
 # =========================
-# ✅ 终极暗黑 CSS（修复左侧白块 + 纯白字体）
+# 暗黑 CSS（修复左侧白块 + 纯白字体）
 # =========================
 st.markdown(
     """
@@ -36,7 +36,6 @@ st.markdown(
         color: #ffffff !important;
     }
 
-    /* Sidebar 全层级强制深色（彻底解决左侧白块） */
     section[data-testid="stSidebar"],
     div[data-testid="stSidebar"],
     [data-testid="stSidebar"] > div {
@@ -50,7 +49,6 @@ st.markdown(
         color: #ffffff !important;
     }
 
-    /* 顶部 Header/Toolbar */
     header[data-testid="stHeader"] { background: transparent !important; height: 0px !important; }
     div[data-testid="stToolbar"] { visibility: hidden !important; height: 0px !important; }
     div[data-testid="stDecoration"] { display: none !important; }
@@ -59,7 +57,6 @@ st.markdown(
     p, span, div, label, li { color: #ffffff !important; }
     .stCaption { color: #dfe6ee !important; }
 
-    /* Metric 卡片 */
     div[data-testid="stMetric"] {
         background: rgba(255,255,255,0.04) !important;
         border: 1px solid rgba(255,255,255,0.08);
@@ -69,7 +66,6 @@ st.markdown(
     div[data-testid="stMetricLabel"] { color: #cfd8e3 !important; font-size: 0.85rem; }
     div[data-testid="stMetricValue"] { color: #ffffff !important; font-weight: 800; }
 
-    /* 状态条 */
     .status-box {
         padding: 12px 14px;
         border-radius: 10px;
@@ -78,7 +74,6 @@ st.markdown(
         margin-top: 10px;
     }
 
-    /* 状态颜色 + 闪烁 */
     @keyframes blinkGreen {
         0%   { opacity: 1; }
         50%  { opacity: 0.2; }
@@ -127,7 +122,7 @@ def market_status_la() -> str:
     return "休市"
 
 # =========================
-# ✅ 最新价：fast_info
+# ✅ 最新价：fast_info（免费里尽可能快）
 # =========================
 @st.cache_data(ttl=2, show_spinner=False)
 def fetch_last_fast_batch(tickers: list[str]) -> tuple[dict[str, float], str]:
@@ -144,7 +139,7 @@ def fetch_last_fast_batch(tickers: list[str]) -> tuple[dict[str, float], str]:
     return out, la_now.strftime("%Y-%m-%d %H:%M:%S")
 
 # =========================
-# ✅ 昨收：日线 Close
+# ✅ 昨收：日线 Close（不复权也行，因为这是“当前尺度”的昨收）
 # =========================
 @st.cache_data(ttl=10 * 60, show_spinner=False)
 def fetch_prev_close_batch(tickers: list[str]) -> tuple[dict[str, float], str]:
@@ -184,7 +179,7 @@ def fetch_prev_close_batch(tickers: list[str]) -> tuple[dict[str, float], str]:
     return out, la_now.strftime("%Y-%m-%d %H:%M:%S")
 
 # =========================
-# ✅ 分时：盘中高点
+# ✅ 分时：盘中高点（今日）
 # =========================
 @st.cache_data(ttl=30, show_spinner=False)
 def fetch_intraday_batch_for_high(tickers: list[str]) -> tuple[pd.DataFrame, str]:
@@ -223,17 +218,18 @@ def get_day_high_from_batch(df: pd.DataFrame, ticker: str) -> float | None:
         return None
 
 # =========================
-# ✅ ATH：历史最高点（ALL）
+# ✅ 关键修复：ATH 用“复权后的 OHLC”计算（auto_adjust=True）
+# 这样 ATH 跟当前价格在同一尺度，最符合你直觉/大多数软件口径
 # =========================
 @st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
-def fetch_ath_batch(tickers: list[str]) -> dict[str, float]:
+def fetch_ath_adjusted_batch(tickers: list[str]) -> dict[str, float]:
     symbols = " ".join(tickers)
     df = yf.download(
         tickers=symbols,
         period="max",
         interval="1d",
         group_by="ticker",
-        auto_adjust=False,
+        auto_adjust=True,      # ✅ 复权 OHLC
         threads=False,
         progress=False,
     )
@@ -248,6 +244,7 @@ def fetch_ath_batch(tickers: list[str]) -> dict[str, float]:
                 sub = df[tk].dropna()
                 if sub.empty:
                     continue
+                # 复权后 High 的最大值
                 ath_map[tk] = float(sub["High"].max())
             except Exception:
                 continue
@@ -284,7 +281,7 @@ with st.sidebar:
         - ≥3.5%：适合进场
         - ≥4.5%：触发买入区间
 
-        ⚠️ 当前高点：**历史最高点（All-time high）**
+        ⚠️ ATH口径：**复权后的历史最高点（更符合“当前尺度”）**
         """
     )
 
@@ -303,12 +300,13 @@ st.markdown(
 last_map, last_updated_at = fetch_last_fast_batch(TICKERS)
 prev_close_map, prev_updated_at = fetch_prev_close_batch(TICKERS)
 intraday_df, interval_used = fetch_intraday_batch_for_high(TICKERS)
-ath_map = fetch_ath_batch(TICKERS)
+ath_map = fetch_ath_adjusted_batch(TICKERS)   # ✅ 用复权 ATH
 
 st.caption(
     f"最新价：fast_info（LA {last_updated_at}）｜"
     f"昨收：日线 Close（LA {prev_updated_at}）｜"
-    f"盘中高点：{interval_used} 分时（自动降级防限流）"
+    f"盘中高点：{interval_used} 分时（自动降级防限流）｜"
+    f"ATH：复权High最大值（auto_adjust=True）"
 )
 
 cols = st.columns(len(TICKERS))
@@ -323,7 +321,7 @@ def render_ticker(col, ticker: str):
         ath = ath_map.get(ticker)
 
         if prev_close is None or ath is None:
-            st.warning("行情暂时不可用（缺少昨收或ATH），稍后自动刷新")
+            st.warning("行情暂时不可用（缺少昨收或复权ATH），稍后自动刷新")
             return
 
         # 回撤计算：优先最新价，否则昨收（休市/无fast时）
@@ -339,7 +337,7 @@ def render_ticker(col, ticker: str):
             "watch": "status-watch",
         }.get(status_kind, "status-watch")
 
-        # ✅ 两行布局：3 + 2（数字不会挤）
+        # 两行布局：3 + 2（数字不挤）
         r1a, r1b, r1c = st.columns(3)
         r2a, r2b = st.columns(2)
 
@@ -347,7 +345,7 @@ def render_ticker(col, ticker: str):
         r1b.metric("闭市前价格（昨收）", fmt_price(prev_close))
         r1c.metric("盘中高点(今日)", fmt_price(day_high) if day_high is not None else "—")
 
-        r2a.metric("历史最高点(ALL)", fmt_price(ath))
+        r2a.metric("历史最高点（复权ATH）", fmt_price(ath))
         r2b.metric("从历史最高点回撤", fmt_pct(drawdown))
 
         st.markdown(
@@ -355,7 +353,7 @@ def render_ticker(col, ticker: str):
             <div class="status-box">
                 <b>状态：</b> <span class="{status_class}">{status_text}</span>
                 <div style="margin-top:6px; opacity:0.85; font-size:0.85rem;">
-                    回撤计算口径：{"最新价（fast）" if last_price is not None else "昨收（休市/无fast）"}
+                    回撤计算口径：{"最新价（fast）" if last_price is not None else "昨收（休市/无fast）"} ｜ ATH口径：复权
                 </div>
             </div>
             """,
