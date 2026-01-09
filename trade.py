@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 # =========================
-# 你的回撤规则（可自己改）
+# 回撤规则（可自己改）
 # =========================
 LEVEL_WAIT = 0.02
 LEVEL_PREP = 0.03
@@ -17,7 +17,7 @@ LEVEL_BUY  = 0.045
 TICKERS = ["QQQ", "SMH", "VGT"]
 
 # =========================
-# Streamlit 基本设置（建议放最前）
+# Streamlit 基本设置
 # =========================
 st.set_page_config(page_title="交易纪律执行助手", layout="wide")
 
@@ -67,7 +67,7 @@ st.markdown(
         padding: 12px;
     }
     div[data-testid="stMetricLabel"] { color: #cfd8e3 !important; font-size: 0.85rem; }
-    div[data-testid="stMetricValue"] { color: #ffffff !important; font-weight: 700; }
+    div[data-testid="stMetricValue"] { color: #ffffff !important; font-weight: 800; }
 
     /* 状态条 */
     .status-box {
@@ -84,11 +84,11 @@ st.markdown(
         50%  { opacity: 0.2; }
         100% { opacity: 1; }
     }
-    .status-buy  { color: #2cff6a !important; font-weight: 800; animation: blinkGreen 1s infinite; }
-    .status-wait { color: #ffd34d !important; font-weight: 700; }
-    .status-good { color: #9dffb8 !important; font-weight: 700; }
-    .status-prep { color: #b6c7ff !important; font-weight: 700; }
-    .status-watch{ color: #cfd8e3 !important; }
+    .status-buy  { color: #2cff6a !important; font-weight: 900; animation: blinkGreen 1s infinite; }
+    .status-wait { color: #ffd34d !important; font-weight: 800; }
+    .status-good { color: #9dffb8 !important; font-weight: 800; }
+    .status-prep { color: #b6c7ff !important; font-weight: 800; }
+    .status-watch{ color: #cfd8e3 !important; font-weight: 700; }
     </style>
     """,
     unsafe_allow_html=True
@@ -127,7 +127,7 @@ def market_status_la() -> str:
     return "休市"
 
 # =========================
-# ✅ 最新价（免费里尽可能快）：fast_info
+# ✅ 最新价：fast_info
 # =========================
 @st.cache_data(ttl=2, show_spinner=False)
 def fetch_last_fast_batch(tickers: list[str]) -> tuple[dict[str, float], str]:
@@ -144,7 +144,7 @@ def fetch_last_fast_batch(tickers: list[str]) -> tuple[dict[str, float], str]:
     return out, la_now.strftime("%Y-%m-%d %H:%M:%S")
 
 # =========================
-# ✅ 昨收（闭市前价格）：日线 Close
+# ✅ 昨收：日线 Close
 # =========================
 @st.cache_data(ttl=10 * 60, show_spinner=False)
 def fetch_prev_close_batch(tickers: list[str]) -> tuple[dict[str, float], str]:
@@ -184,7 +184,7 @@ def fetch_prev_close_batch(tickers: list[str]) -> tuple[dict[str, float], str]:
     return out, la_now.strftime("%Y-%m-%d %H:%M:%S")
 
 # =========================
-# ✅ 分时：盘中高点（今日）
+# ✅ 分时：盘中高点
 # =========================
 @st.cache_data(ttl=30, show_spinner=False)
 def fetch_intraday_batch_for_high(tickers: list[str]) -> tuple[pd.DataFrame, str]:
@@ -275,7 +275,7 @@ st.caption(
 
 with st.sidebar:
     st.header("设置")
-    refresh = st.slider("自动刷新间隔（秒）", 3, 60, 5, 1)
+    refresh = st.slider("自动刷新间隔（秒）", 3, 120, 10, 1)
     st.markdown(
         """
         **规则分层**
@@ -283,6 +283,7 @@ with st.sidebar:
         - ≥3%：准备进场
         - ≥3.5%：适合进场
         - ≥4.5%：触发买入区间
+
         ⚠️ 当前高点：**历史最高点（All-time high）**
         """
     )
@@ -305,9 +306,9 @@ intraday_df, interval_used = fetch_intraday_batch_for_high(TICKERS)
 ath_map = fetch_ath_batch(TICKERS)
 
 st.caption(
-    f"最新价来源：fast_info（更新于 LA {last_updated_at}）｜"
-    f"上一交易日收盘：日线 Close（更新于 LA {prev_updated_at}）｜"
-    f"盘中高点分时精度：{interval_used}（自动降级防限流）"
+    f"最新价：fast_info（LA {last_updated_at}）｜"
+    f"昨收：日线 Close（LA {prev_updated_at}）｜"
+    f"盘中高点：{interval_used} 分时（自动降级防限流）"
 )
 
 cols = st.columns(len(TICKERS))
@@ -325,6 +326,7 @@ def render_ticker(col, ticker: str):
             st.warning("行情暂时不可用（缺少昨收或ATH），稍后自动刷新")
             return
 
+        # 回撤计算：优先最新价，否则昨收（休市/无fast时）
         price_for_dd = last_price if last_price is not None else prev_close
         drawdown = max(0.0, (ath - price_for_dd) / ath)
         status_text, status_kind = classify(drawdown)
@@ -337,19 +339,21 @@ def render_ticker(col, ticker: str):
             "watch": "status-watch",
         }.get(status_kind, "status-watch")
 
-        c1, c2, c3, c4, c5 = st.columns(5)
+        # ✅ 两行布局：3 + 2（数字不会挤）
+        r1a, r1b, r1c = st.columns(3)
+        r2a, r2b = st.columns(2)
 
-        c1.metric("最新价格（fast）", fmt_price(last_price) if last_price is not None else "—")
-        c2.metric("闭市前价格（昨收）", fmt_price(prev_close))
-        c3.metric("盘中高点(今日)", fmt_price(day_high) if day_high is not None else "—")
-        c4.metric("历史最高点(ALL)", fmt_price(ath))
-        c5.metric("从历史最高点回撤", fmt_pct(drawdown))
+        r1a.metric("最新价格（fast）", fmt_price(last_price) if last_price is not None else "—")
+        r1b.metric("闭市前价格（昨收）", fmt_price(prev_close))
+        r1c.metric("盘中高点(今日)", fmt_price(day_high) if day_high is not None else "—")
+
+        r2a.metric("历史最高点(ALL)", fmt_price(ath))
+        r2b.metric("从历史最高点回撤", fmt_pct(drawdown))
 
         st.markdown(
             f"""
             <div class="status-box">
-                <b>状态：</b>
-                <span class="{status_class}">{status_text}</span>
+                <b>状态：</b> <span class="{status_class}">{status_text}</span>
                 <div style="margin-top:6px; opacity:0.85; font-size:0.85rem;">
                     回撤计算口径：{"最新价（fast）" if last_price is not None else "昨收（休市/无fast）"}
                 </div>
