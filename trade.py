@@ -14,7 +14,8 @@ LEVEL_PREP = 0.03
 LEVEL_GOOD = 0.035
 LEVEL_BUY  = 0.045
 
-TICKERS = ["QQQ", "SMH", "VGT"]
+# ✅ 只增加 IYW 作为观察ETF（其他不动）
+TICKERS = ["QQQ", "SMH", "VGT", "IYW"]
 
 # =========================
 # Streamlit 基本设置
