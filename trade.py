@@ -14,7 +14,7 @@ LEVEL_PREP = 0.03
 LEVEL_GOOD = 0.035
 LEVEL_BUY  = 0.045
 
-# ✅ 只增加 IYW 作为观察ETF（其他不动）
+# ✅ 增加 IYW 作为观察ETF
 TICKERS = ["QQQ", "SMH", "VGT", "IYW"]
 
 # =========================
@@ -85,6 +85,17 @@ st.markdown(
     .status-good { color: #9dffb8 !important; font-weight: 800; }
     .status-prep { color: #b6c7ff !important; font-weight: 800; }
     .status-watch{ color: #cfd8e3 !important; font-weight: 700; }
+
+    /* 小提示条（用于“缺失/降级”提示） */
+    .note-box {
+        padding: 10px 12px;
+        border-radius: 10px;
+        border: 1px solid rgba(255,255,255,0.10);
+        background: rgba(255,255,255,0.03);
+        margin-top: 10px;
+        opacity: 0.95;
+        font-size: 0.90rem;
+    }
     </style>
     """,
     unsafe_allow_html=True
@@ -104,10 +115,14 @@ def classify(drawdown: float) -> tuple[str, str]:
         return "等待（≥2.0%）", "wait"
     return "观望（<2.0%)", "watch"
 
-def fmt_price(x: float) -> str:
+def fmt_price(x: float | None) -> str:
+    if x is None:
+        return "—"
     return f"{x:.2f}"
 
-def fmt_pct(x: float) -> str:
+def fmt_pct(x: float | None) -> str:
+    if x is None:
+        return "—"
     return f"{x*100:.2f}%"
 
 def market_status_la() -> str:
@@ -122,65 +137,66 @@ def market_status_la() -> str:
         return "盘后"
     return "休市"
 
+def now_la_str() -> str:
+    return datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M:%S")
+
 # =========================
-# ✅ 最新价：fast_info（免费里尽可能快）
+# ✅ 最新价：fast_info（逐个 ticker）
 # =========================
 @st.cache_data(ttl=2, show_spinner=False)
-def fetch_last_fast_batch(tickers: list[str]) -> tuple[dict[str, float], str]:
+def fetch_last_fast_one(tk: str) -> float | None:
+    try:
+        t = yf.Ticker(tk)
+        lp = t.fast_info.get("last_price", None)
+        if lp is None:
+            return None
+        return float(lp)
+    except Exception:
+        return None
+
+@st.cache_data(ttl=2, show_spinner=False)
+def fetch_last_fast_map(tickers: list[str]) -> dict[str, float]:
     out: dict[str, float] = {}
     for tk in tickers:
-        try:
-            t = yf.Ticker(tk)
-            lp = t.fast_info.get("last_price", None)
-            if lp is not None:
-                out[tk] = float(lp)
-        except Exception:
-            pass
-    la_now = datetime.now(ZoneInfo("America/Los_Angeles"))
-    return out, la_now.strftime("%Y-%m-%d %H:%M:%S")
+        v = fetch_last_fast_one(tk)
+        if v is not None:
+            out[tk] = v
+    return out
 
 # =========================
-# ✅ 昨收：日线 Close（不复权也行，因为这是“当前尺度”的昨收）
+# ✅ 昨收：日线 Close（逐个 ticker，更稳，不会出现 MultiIndex/单ticker错配）
 # =========================
 @st.cache_data(ttl=10 * 60, show_spinner=False)
-def fetch_prev_close_batch(tickers: list[str]) -> tuple[dict[str, float], str]:
-    symbols = " ".join(tickers)
+def fetch_prev_close_one(tk: str) -> float | None:
     try:
         df = yf.download(
-            tickers=symbols,
+            tickers=tk,
             period="5d",
             interval="1d",
-            group_by="ticker",
             auto_adjust=False,
-            threads=False,
             progress=False,
+            threads=False,
         )
+        if df is None or df.empty or "Close" not in df.columns:
+            return None
+        s = df["Close"].dropna()
+        if s.empty:
+            return None
+        return float(s.iloc[-1])
     except Exception:
-        return {}, "NA"
+        return None
 
+@st.cache_data(ttl=10 * 60, show_spinner=False)
+def fetch_prev_close_map(tickers: list[str]) -> dict[str, float]:
     out: dict[str, float] = {}
-    if df is None or df.empty:
-        return out, "NA"
-
-    try:
-        if isinstance(df.columns, pd.MultiIndex):
-            for tk in tickers:
-                sub = df[tk].dropna()
-                if sub.empty or "Close" not in sub.columns:
-                    continue
-                out[tk] = float(sub["Close"].iloc[-1])
-        else:
-            sub = df.dropna()
-            if not sub.empty and "Close" in sub.columns:
-                out[tickers[0]] = float(sub["Close"].iloc[-1])
-    except Exception:
-        pass
-
-    la_now = datetime.now(ZoneInfo("America/Los_Angeles"))
-    return out, la_now.strftime("%Y-%m-%d %H:%M:%S")
+    for tk in tickers:
+        v = fetch_prev_close_one(tk)
+        if v is not None:
+            out[tk] = v
+    return out
 
 # =========================
-# ✅ 分时：盘中高点（今日）
+# ✅ 分时：盘中高点（今日）仍用批量（可降级）
 # =========================
 @st.cache_data(ttl=30, show_spinner=False)
 def fetch_intraday_batch_for_high(tickers: list[str]) -> tuple[pd.DataFrame, str]:
@@ -208,55 +224,48 @@ def get_day_high_from_batch(df: pd.DataFrame, ticker: str) -> float | None:
     try:
         if isinstance(df.columns, pd.MultiIndex):
             sub = df[ticker].dropna()
-            if sub.empty:
+            if sub.empty or "High" not in sub.columns:
                 return None
             return float(sub["High"].max())
+        # 单 ticker 返回
         sub = df.dropna()
-        if sub.empty:
+        if sub.empty or "High" not in sub.columns:
             return None
         return float(sub["High"].max())
     except Exception:
         return None
 
 # =========================
-# ✅ 关键修复：ATH 用“复权后的 OHLC”计算（auto_adjust=True）
-# 这样 ATH 跟当前价格在同一尺度，最符合你直觉/大多数软件口径
+# ✅ ATH：用“复权后的 OHLC”计算（auto_adjust=True）——改为逐个 ticker，更稳
 # =========================
 @st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
-def fetch_ath_adjusted_batch(tickers: list[str]) -> dict[str, float]:
-    symbols = " ".join(tickers)
-    df = yf.download(
-        tickers=symbols,
-        period="max",
-        interval="1d",
-        group_by="ticker",
-        auto_adjust=True,      # ✅ 复权 OHLC
-        threads=False,
-        progress=False,
-    )
+def fetch_ath_adjusted_one(tk: str) -> float | None:
+    try:
+        df = yf.download(
+            tickers=tk,
+            period="max",
+            interval="1d",
+            auto_adjust=True,   # ✅ 复权 OHLC
+            progress=False,
+            threads=False,
+        )
+        if df is None or df.empty or "High" not in df.columns:
+            return None
+        s = df["High"].dropna()
+        if s.empty:
+            return None
+        return float(s.max())
+    except Exception:
+        return None
 
-    ath_map: dict[str, float] = {}
-    if df is None or df.empty:
-        return ath_map
-
-    if isinstance(df.columns, pd.MultiIndex):
-        for tk in tickers:
-            try:
-                sub = df[tk].dropna()
-                if sub.empty:
-                    continue
-                # 复权后 High 的最大值
-                ath_map[tk] = float(sub["High"].max())
-            except Exception:
-                continue
-    else:
-        try:
-            sub = df.dropna()
-            ath_map[tickers[0]] = float(sub["High"].max())
-        except Exception:
-            pass
-
-    return ath_map
+@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
+def fetch_ath_adjusted_map(tickers: list[str]) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for tk in tickers:
+        v = fetch_ath_adjusted_one(tk)
+        if v is not None:
+            out[tk] = v
+    return out
 
 # =========================
 # 页面内容
@@ -297,15 +306,17 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-# 拉数据
-last_map, last_updated_at = fetch_last_fast_batch(TICKERS)
-prev_close_map, prev_updated_at = fetch_prev_close_batch(TICKERS)
+# =========================
+# 拉数据（更稳：昨收/ATH逐个 ticker）
+# =========================
+last_map = fetch_last_fast_map(TICKERS)
+prev_close_map = fetch_prev_close_map(TICKERS)
 intraday_df, interval_used = fetch_intraday_batch_for_high(TICKERS)
-ath_map = fetch_ath_adjusted_batch(TICKERS)   # ✅ 用复权 ATH
+ath_map = fetch_ath_adjusted_map(TICKERS)
 
 st.caption(
-    f"最新价：fast_info（LA {last_updated_at}）｜"
-    f"昨收：日线 Close（LA {prev_updated_at}）｜"
+    f"最新价：fast_info（LA {now_la_str()}）｜"
+    f"昨收：日线 Close（LA {now_la_str()}）｜"
     f"盘中高点：{interval_used} 分时（自动降级防限流）｜"
     f"ATH：复权High最大值（auto_adjust=True）"
 )
@@ -321,14 +332,26 @@ def render_ticker(col, ticker: str):
         day_high = get_day_high_from_batch(intraday_df, ticker)
         ath = ath_map.get(ticker)
 
-        if prev_close is None or ath is None:
-            st.warning("行情暂时不可用（缺少昨收或复权ATH），稍后自动刷新")
-            return
+        # ✅ 允许“部分缺失”，不整块废掉
+        missing_msgs = []
+        if prev_close is None:
+            missing_msgs.append("昨收缺失")
+        if ath is None:
+            missing_msgs.append("复权ATH缺失（可能是限流/暂时拉不到历史数据）")
 
-        # 回撤计算：优先最新价，否则昨收（休市/无fast时）
-        price_for_dd = last_price if last_price is not None else prev_close
-        drawdown = max(0.0, (ath - price_for_dd) / ath)
-        status_text, status_kind = classify(drawdown)
+        # 回撤需要 ATH + 价格（优先 last，否则 prev_close）
+        price_for_dd: float | None = None
+        if last_price is not None:
+            price_for_dd = last_price
+        elif prev_close is not None:
+            price_for_dd = prev_close
+
+        drawdown: float | None = None
+        status_text, status_kind = "观望（数据不足）", "watch"
+
+        if ath is not None and price_for_dd is not None:
+            drawdown = max(0.0, (ath - price_for_dd) / ath)
+            status_text, status_kind = classify(drawdown)
 
         status_class = {
             "buy": "status-buy",
@@ -342,9 +365,9 @@ def render_ticker(col, ticker: str):
         r1a, r1b, r1c = st.columns(3)
         r2a, r2b = st.columns(2)
 
-        r1a.metric("最新价格（fast）", fmt_price(last_price) if last_price is not None else "—")
+        r1a.metric("最新价格（fast）", fmt_price(last_price))
         r1b.metric("闭市前价格（昨收）", fmt_price(prev_close))
-        r1c.metric("盘中高点(今日)", fmt_price(day_high) if day_high is not None else "—")
+        r1c.metric("盘中高点(今日)", fmt_price(day_high))
 
         r2a.metric("历史最高点（复权ATH）", fmt_price(ath))
         r2b.metric("从历史最高点回撤", fmt_pct(drawdown))
@@ -354,12 +377,25 @@ def render_ticker(col, ticker: str):
             <div class="status-box">
                 <b>状态：</b> <span class="{status_class}">{status_text}</span>
                 <div style="margin-top:6px; opacity:0.85; font-size:0.85rem;">
-                    回撤计算口径：{"最新价（fast）" if last_price is not None else "昨收（休市/无fast）"} ｜ ATH口径：复权
+                    回撤价格口径：{"最新价（fast）" if last_price is not None else ("昨收（休市/无fast）" if prev_close is not None else "缺失")} ｜ 
+                    ATH口径：{"复权" if ath is not None else "缺失"}
                 </div>
             </div>
             """,
             unsafe_allow_html=True
         )
+
+        if missing_msgs:
+            st.markdown(
+                f"""
+                <div class="note-box">
+                    ⚠️ {ticker} 数据不完整：{ "；".join(missing_msgs) }。<br/>
+                    建议：稍等自动刷新；或把自动刷新调到 15~30 秒；或减少同时监控的标的数量。
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
         st.caption("核心纪律：用明确数字对抗情绪，用纪律换取长期复利。")
 
 for i, tk in enumerate(TICKERS):
