@@ -164,7 +164,7 @@ def fetch_last_fast_map(tickers: list[str]) -> dict[str, float]:
     return out
 
 # =========================
-# ✅ 昨收：日线 Close（逐个 ticker，更稳，不会出现 MultiIndex/单ticker错配）
+# ✅ 昨收：日线 Close（逐个 ticker，更稳）
 # =========================
 @st.cache_data(ttl=10 * 60, show_spinner=False)
 def fetch_prev_close_one(tk: str) -> float | None:
@@ -196,10 +196,11 @@ def fetch_prev_close_map(tickers: list[str]) -> dict[str, float]:
     return out
 
 # =========================
-# ✅ 分时：盘中高点（今日）仍用批量（可降级）
+# ✅ 分时：盘中高点（今日）批量（可降级）
+#    同时也用它来兜底“最新价”（取 Close 最后一笔）
 # =========================
 @st.cache_data(ttl=30, show_spinner=False)
-def fetch_intraday_batch_for_high(tickers: list[str]) -> tuple[pd.DataFrame, str]:
+def fetch_intraday_batch(tickers: list[str]) -> tuple[pd.DataFrame, str]:
     symbols = " ".join(tickers)
     for interval in ["1m", "2m", "5m"]:
         try:
@@ -227,7 +228,6 @@ def get_day_high_from_batch(df: pd.DataFrame, ticker: str) -> float | None:
             if sub.empty or "High" not in sub.columns:
                 return None
             return float(sub["High"].max())
-        # 单 ticker 返回
         sub = df.dropna()
         if sub.empty or "High" not in sub.columns:
             return None
@@ -235,8 +235,25 @@ def get_day_high_from_batch(df: pd.DataFrame, ticker: str) -> float | None:
     except Exception:
         return None
 
+def get_last_close_from_batch(df: pd.DataFrame, ticker: str) -> float | None:
+    """从分时批量数据里取该 ticker 的 Close 最后一笔（兜底最新价）"""
+    if df is None or df.empty:
+        return None
+    try:
+        if isinstance(df.columns, pd.MultiIndex):
+            sub = df[ticker].dropna()
+            if sub.empty or "Close" not in sub.columns:
+                return None
+            return float(sub["Close"].dropna().iloc[-1])
+        sub = df.dropna()
+        if sub.empty or "Close" not in sub.columns:
+            return None
+        return float(sub["Close"].dropna().iloc[-1])
+    except Exception:
+        return None
+
 # =========================
-# ✅ ATH：用“复权后的 OHLC”计算（auto_adjust=True）——改为逐个 ticker，更稳
+# ✅ ATH：用“复权后的 OHLC”计算（auto_adjust=True）——逐个 ticker 更稳
 # =========================
 @st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
 def fetch_ath_adjusted_one(tk: str) -> float | None:
@@ -307,17 +324,17 @@ st.markdown(
 )
 
 # =========================
-# 拉数据（更稳：昨收/ATH逐个 ticker）
+# 拉数据（更稳：昨收/ATH逐个 ticker；分时批量同时兜底最新价）
 # =========================
-last_map = fetch_last_fast_map(TICKERS)
+last_fast_map = fetch_last_fast_map(TICKERS)
 prev_close_map = fetch_prev_close_map(TICKERS)
-intraday_df, interval_used = fetch_intraday_batch_for_high(TICKERS)
+intraday_df, interval_used = fetch_intraday_batch(TICKERS)
 ath_map = fetch_ath_adjusted_map(TICKERS)
 
 st.caption(
-    f"最新价：fast_info（LA {now_la_str()}）｜"
+    f"最新价：fast_info（有时休市会缺失，会自动用分时Close/昨收兜底）｜"
     f"昨收：日线 Close（LA {now_la_str()}）｜"
-    f"盘中高点：{interval_used} 分时（自动降级防限流）｜"
+    f"盘中高点/兜底最新价：{interval_used} 分时（自动降级防限流）｜"
     f"ATH：复权High最大值（auto_adjust=True）"
 )
 
@@ -327,10 +344,24 @@ def render_ticker(col, ticker: str):
     with col:
         st.subheader(f"标的：{ticker}")
 
-        last_price = last_map.get(ticker)
+        last_fast = last_fast_map.get(ticker)
         prev_close = prev_close_map.get(ticker)
         day_high = get_day_high_from_batch(intraday_df, ticker)
+        last_from_bar = get_last_close_from_batch(intraday_df, ticker)
         ath = ath_map.get(ticker)
+
+        # ✅ 选择“最新价”显示：fast -> 分时Close最后一笔 -> 昨收
+        last_price: float | None = None
+        source = "缺失"
+        if last_fast is not None:
+            last_price = last_fast
+            source = "fast"
+        elif last_from_bar is not None:
+            last_price = last_from_bar
+            source = f"{interval_used}分时Close"
+        elif prev_close is not None:
+            last_price = prev_close
+            source = "昨收"
 
         # ✅ 允许“部分缺失”，不整块废掉
         missing_msgs = []
@@ -338,19 +369,15 @@ def render_ticker(col, ticker: str):
             missing_msgs.append("昨收缺失")
         if ath is None:
             missing_msgs.append("复权ATH缺失（可能是限流/暂时拉不到历史数据）")
+        if last_price is None:
+            missing_msgs.append("最新价缺失（fast/分时/昨收都没拿到）")
 
-        # 回撤需要 ATH + 价格（优先 last，否则 prev_close）
-        price_for_dd: float | None = None
-        if last_price is not None:
-            price_for_dd = last_price
-        elif prev_close is not None:
-            price_for_dd = prev_close
-
+        # 回撤需要 ATH + 价格（优先最新价）
         drawdown: float | None = None
         status_text, status_kind = "观望（数据不足）", "watch"
 
-        if ath is not None and price_for_dd is not None:
-            drawdown = max(0.0, (ath - price_for_dd) / ath)
+        if ath is not None and last_price is not None:
+            drawdown = max(0.0, (ath - last_price) / ath)
             status_text, status_kind = classify(drawdown)
 
         status_class = {
@@ -365,7 +392,7 @@ def render_ticker(col, ticker: str):
         r1a, r1b, r1c = st.columns(3)
         r2a, r2b = st.columns(2)
 
-        r1a.metric("最新价格（fast）", fmt_price(last_price))
+        r1a.metric(f"最新价格（{source}）", fmt_price(last_price))
         r1b.metric("闭市前价格（昨收）", fmt_price(prev_close))
         r1c.metric("盘中高点(今日)", fmt_price(day_high))
 
@@ -377,8 +404,7 @@ def render_ticker(col, ticker: str):
             <div class="status-box">
                 <b>状态：</b> <span class="{status_class}">{status_text}</span>
                 <div style="margin-top:6px; opacity:0.85; font-size:0.85rem;">
-                    回撤价格口径：{"最新价（fast）" if last_price is not None else ("昨收（休市/无fast）" if prev_close is not None else "缺失")} ｜ 
-                    ATH口径：{"复权" if ath is not None else "缺失"}
+                    最新价口径：{source} ｜ ATH口径：{"复权" if ath is not None else "缺失"}
                 </div>
             </div>
             """,
